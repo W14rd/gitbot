@@ -124,6 +124,9 @@ temp/
 # package-lock.json
 # yarn.lock
 # Gemfile.lock
+
+# Gitbot internal files (don't commit gitbot state)
+.gitbot/
 EOF
     
     print_msg "$GREEN" "✓ Created .gitignore with common patterns"
@@ -161,17 +164,31 @@ init_git_repo() {
     create_gitignore "$repo_path"
     
     # Initial commit
-    git add .
-    if git diff --cached --quiet; then
+    git add -A
+    
+    # Check if there are actually files to commit
+    local files_to_commit=$(git diff --cached --name-only | wc -l)
+    
+    if [ "$files_to_commit" -eq 0 ]; then
         print_msg "$YELLOW" "No files to commit initially."
+        print_msg "$BLUE" "Current directory contents:"
+        ls -la
+        print_msg "$YELLOW" "Check if files are being ignored by .gitignore"
     else
-        git commit -m "Initial commit by Gitbot" > /dev/null 2>&1
-        print_msg "$GREEN" "✓ Created initial commit"
-        log "Created initial commit in $repo_path"
+        print_msg "$BLUE" "Files to commit: $files_to_commit"
+        git diff --cached --name-only | sed 's/^/  - /'
         
-        # Push initial commit if GitHub is configured
-        if [ "$enable_push" = "true" ]; then
-            push_to_github
+        if git commit -m "Initial commit by Gitbot" > /dev/null 2>&1; then
+            print_msg "$GREEN" "✓ Created initial commit with $files_to_commit file(s)"
+            log "Created initial commit in $repo_path with $files_to_commit files"
+            
+            # Push initial commit if GitHub is configured
+            if [ "$enable_push" = "true" ]; then
+                push_to_github
+            fi
+        else
+            print_msg "$RED" "Failed to create initial commit"
+            log "ERROR: Failed to create initial commit"
         fi
     fi
 }
@@ -317,16 +334,28 @@ setup_github_remote() {
 push_to_github() {
     print_msg "$BLUE" "Pushing to GitHub..."
     
-    if git push -u origin main >> "$LOG_FILE" 2>&1; then
+    # Try to push, capture output
+    local push_output=$(git push -u origin main 2>&1)
+    local push_status=$?
+    
+    if [ $push_status -eq 0 ]; then
         print_msg "$GREEN" "✓ Pushed to GitHub successfully"
         log "Pushed to GitHub"
+        return 0
     else
-        print_msg "$RED" "Failed to push to GitHub. Check log: $LOG_FILE"
-        print_msg "$YELLOW" "Make sure:"
-        echo "  1. The repository exists on GitHub"
-        echo "  2. You have authentication configured (SSH keys or credential helper)"
-        echo "  3. You have push permissions"
-        log "ERROR: Failed to push to GitHub"
+        print_msg "$RED" "Failed to push to GitHub."
+        echo "$push_output"
+        print_msg "$YELLOW" "Common issues:"
+        echo "  1. Repository doesn't exist on GitHub"
+        echo "  2. Authentication not configured (SSH keys or credential helper)"
+        echo "  3. No push permissions"
+        echo ""
+        print_msg "$YELLOW" "Check the log file for details: $LOG_FILE"
+        log "ERROR: Failed to push to GitHub - $push_output"
+        
+        # Don't exit, let monitoring continue
+        print_msg "$YELLOW" "Continuing with local commits only. Fix authentication to enable push."
+        return 1
     fi
 }
 
@@ -381,7 +410,7 @@ start_gitbot() {
     local interval=""
     local enable_push="false"
     
-    # Parse arguments
+    # Parse arguments - accept both orders: "30 -h" or "-h 30"
     while [ $# -gt 0 ]; do
         case "$1" in
             -h)
@@ -389,7 +418,7 @@ start_gitbot() {
                 shift
                 ;;
             *)
-                if [ -z "$interval" ]; then
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
                     interval="$1"
                 fi
                 shift
@@ -402,7 +431,7 @@ start_gitbot() {
     # Validate interval
     if [ -z "$interval" ] || ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
         print_msg "$RED" "Error: Invalid interval. Please provide a positive number of seconds."
-        echo "Usage: gitbot start <seconds> [-h]"
+        echo "Usage: gitbot start <seconds> [-h]  or  gitbot start -h <seconds>"
         echo "  -h    Enable push to GitHub"
         exit 1
     fi
@@ -434,17 +463,75 @@ start_gitbot() {
     # Save state
     echo "$repo_path|$interval|$repo_name|$enable_push" > "$STATE_FILE"
     
-    # Start monitoring in background
-    (
-        trap 'log "Gitbot stopped"; rm -f "$PID_FILE"; exit 0' SIGTERM SIGINT
-        monitor_changes "$repo_path" "$interval" "$enable_push"
-    ) &
+    # Create a wrapper script for the monitoring process
+    local monitor_script="$GITBOT_DIR/monitor_${pid}.sh"
+    cat > "$monitor_script" << 'MONITOR_EOF'
+#!/bin/bash
+REPO_PATH="$1"
+INTERVAL="$2"
+ENABLE_PUSH="$3"
+LOG_FILE="$4"
+
+cd "$REPO_PATH" || exit 1
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+log "Monitor started: PID $"
+
+while true; do
+    cd "$REPO_PATH" || {
+        log "ERROR: Cannot access repository path $REPO_PATH"
+        sleep "$INTERVAL"
+        continue
+    }
+    
+    git add -A 2>> "$LOG_FILE"
+    
+    if ! git diff --cached --quiet 2>> "$LOG_FILE"; then
+        changed_files=$(git diff --cached --name-only | tr '\n' ', ' | sed 's/,$//')
+        
+        if [ -n "$changed_files" ]; then
+            commit_msg="Edited: $changed_files"
+            
+            if git commit -m "$commit_msg" >> "$LOG_FILE" 2>&1; then
+                log "Auto-committed changes: $changed_files"
+                
+                if [ "$ENABLE_PUSH" = "true" ]; then
+                    if git push origin main >> "$LOG_FILE" 2>&1; then
+                        log "Pushed changes to GitHub"
+                    else
+                        log "ERROR: Failed to push to GitHub"
+                    fi
+                fi
+            else
+                log "ERROR: Failed to commit changes"
+            fi
+        fi
+    fi
+    
+    sleep "$INTERVAL"
+done
+MONITOR_EOF
+    
+    chmod +x "$monitor_script"
+    
+    # Start monitoring in background using nohup for better persistence
+    nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$LOG_FILE" > /dev/null 2>&1 &
     
     local pid=$!
     echo "$pid" > "$PID_FILE"
     
-    # Make the background process independent
-    disown
+    # Wait a moment and verify the process started
+    sleep 1
+    if ! ps -p "$pid" > /dev/null 2>&1; then
+        print_msg "$RED" "Error: Failed to start monitoring process"
+        print_msg "$YELLOW" "Check log file: $LOG_FILE"
+        rm -f "$PID_FILE"
+        rm -f "$monitor_script"
+        exit 1
+    fi
     
     print_msg "$GREEN" "✓ Gitbot started successfully!"
     echo ""
@@ -475,14 +562,23 @@ stop_gitbot() {
     
     if ps -p "$pid" > /dev/null 2>&1; then
         kill "$pid" 2>> "$LOG_FILE"
+        sleep 1
+        
+        # Force kill if still running
+        if ps -p "$pid" > /dev/null 2>&1; then
+            kill -9 "$pid" 2>> "$LOG_FILE"
+        fi
+        
         rm -f "$PID_FILE"
         rm -f "$STATE_FILE"
+        rm -f "$GITBOT_DIR/monitor_${pid}.sh" 2>/dev/null
         print_msg "$GREEN" "✓ Gitbot stopped successfully."
         log "Gitbot stopped (PID: $pid)"
     else
         print_msg "$YELLOW" "Gitbot process not found. Cleaning up..."
         rm -f "$PID_FILE"
         rm -f "$STATE_FILE"
+        rm -f "$GITBOT_DIR"/monitor_*.sh 2>/dev/null
     fi
 }
 
@@ -538,15 +634,65 @@ restart_gitbot() {
     
     cd "$repo_path" || exit 1
     
-    # Start monitoring in background
-    (
-        trap 'log "Gitbot stopped"; rm -f "$PID_FILE"; exit 0' SIGTERM SIGINT
-        monitor_changes "$repo_path" "$interval" "$enable_push"
-    ) &
+    # Create monitor script
+    local pid=$
+    local monitor_script="$GITBOT_DIR/monitor_${pid}.sh"
+    cat > "$monitor_script" << 'MONITOR_EOF'
+#!/bin/bash
+REPO_PATH="$1"
+INTERVAL="$2"
+ENABLE_PUSH="$3"
+LOG_FILE="$4"
+
+cd "$REPO_PATH" || exit 1
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+log "Monitor restarted: PID $"
+
+while true; do
+    cd "$REPO_PATH" || {
+        log "ERROR: Cannot access repository path $REPO_PATH"
+        sleep "$INTERVAL"
+        continue
+    }
     
-    local pid=$!
+    git add -A 2>> "$LOG_FILE"
+    
+    if ! git diff --cached --quiet 2>> "$LOG_FILE"; then
+        changed_files=$(git diff --cached --name-only | tr '\n' ', ' | sed 's/,$//')
+        
+        if [ -n "$changed_files" ]; then
+            commit_msg="Edited: $changed_files"
+            
+            if git commit -m "$commit_msg" >> "$LOG_FILE" 2>&1; then
+                log "Auto-committed changes: $changed_files"
+                
+                if [ "$ENABLE_PUSH" = "true" ]; then
+                    if git push origin main >> "$LOG_FILE" 2>&1; then
+                        log "Pushed changes to GitHub"
+                    else
+                        log "ERROR: Failed to push to GitHub"
+                    fi
+                fi
+            else
+                log "ERROR: Failed to commit changes"
+            fi
+        fi
+    fi
+    
+    sleep "$INTERVAL"
+done
+MONITOR_EOF
+    
+    chmod +x "$monitor_script"
+    
+    nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$LOG_FILE" > /dev/null 2>&1 &
+    
+    pid=$!
     echo "$pid" > "$PID_FILE"
-    disown
     
     log "Gitbot restarted: PID $pid"
 }
@@ -575,6 +721,7 @@ main() {
             echo ""
             echo "Usage:"
             echo "  gitbot start <seconds> [-h]  Start monitoring and auto-committing"
+            echo "  gitbot start -h <seconds>    Alternative syntax"
             echo "                               -h: Enable push to GitHub"
             echo "  gitbot end                   Stop monitoring"
             echo "  gitbot status                Show current status"
@@ -582,6 +729,7 @@ main() {
             echo "Examples:"
             echo "  gitbot start 30              Monitor and commit every 30 seconds (local only)"
             echo "  gitbot start 30 -h           Monitor, commit and push to GitHub every 30 seconds"
+            echo "  gitbot start -h 120          Same as above (arguments can be in any order)"
             echo "  gitbot end                   Stop gitbot"
             exit 1
             ;;
