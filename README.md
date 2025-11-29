@@ -1,7 +1,7 @@
 Simple ./ dir tracker for automated commits and pushes. Persists across boots
 
 ```
-sudo nano /usr/local/bin/gitbot
+sudo nano /usr/local/bin/gitbot # paste the code
 sudo chmod +x /usr/local/bin/gitbot
 
 # Start commiting and pushing changes each 300 seconds
