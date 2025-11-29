@@ -1,4 +1,4 @@
-Simple ./ dir tracker for automated commits and pushes
+Simple ./ dir tracker for automated commits and pushes. Persists across boots
 
 ```
 sudo nano /usr/local/bin/gitbot
