@@ -1,13 +1,22 @@
 #!/bin/bash
 
-#####
+####
 
 set -e
 
+project_id() {
+    echo -n "$PWD" | sha256sum | cut -c1-16
+}
+
 GITBOT_DIR="$HOME/.gitbot"
-STATE_FILE="$GITBOT_DIR/state"
-LOG_FILE="$GITBOT_DIR/gitbot.log"
-PID_FILE="$GITBOT_DIR/gitbot.pid"
+PROJECT_ID=$(project_id)
+
+PID_FILE="$GITBOT_DIR/pids/$PROJECT_ID.pid"
+STATE_FILE="$GITBOT_DIR/states/$PROJECT_ID.state"
+LOG_FILE="$GITBOT_DIR/logs/$PROJECT_ID.log"
+BOOT_FILE="$GITBOT_DIR/boot_check"
+
+mkdir -p "$GITBOT_DIR/pids" "$GITBOT_DIR/logs" "$GITBOT_DIR/states"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,8 +39,193 @@ print_msg() {
 
 check_git() {
     if ! command -v git &> /dev/null; then
-        print_msg "$RED" "Error: git is not installed. Please install git first."
+        print_msg "$RED" "Error: git is not installed"
         exit 1
+    fi
+}
+
+check_boot_and_restart() {
+    local current_boot_time=$(who -b 2>/dev/null | awk '{print $3" "$4}' || uptime -s 2>/dev/null || echo "unknown")
+    local last_boot_time=""
+    
+    if [ -f "$BOOT_FILE" ]; then
+        last_boot_time=$(cat "$BOOT_FILE")
+    fi
+    
+    if [ "$current_boot_time" != "$last_boot_time" ] && [ "$current_boot_time" != "unknown" ]; then
+        log "Boot detected. Previous: $last_boot_time, Current: $current_boot_time"
+        echo "$current_boot_time" > "$BOOT_FILE"
+        
+        for state_file in "$GITBOT_DIR/states"/*.state; do
+            if [ -f "$state_file" ]; then
+                local state_project_id=$(basename "$state_file" .state)
+                IFS='|' read -r repo_path interval repo_name enable_push < "$state_file"
+                
+                if [ -d "$repo_path" ]; then
+                    log "Auto-restarting gitbot for: $repo_name at $repo_path"
+                    
+                    cd "$repo_path" || continue
+                    
+                    local monitor_script="$GITBOT_DIR/monitor_${state_project_id}.sh"
+                    create_monitor_script "$monitor_script"
+                    
+                    nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$GITBOT_DIR/logs/${state_project_id}.log" > /dev/null 2>&1 &
+                    
+                    local new_pid=$!
+                    echo "$new_pid" > "$GITBOT_DIR/pids/${state_project_id}.pid"
+                    
+                    log "Restarted gitbot for $repo_name with PID $new_pid"
+                fi
+            fi
+        done
+    elif [ "$current_boot_time" = "unknown" ]; then
+        for state_file in "$GITBOT_DIR/states"/*.state; do
+            if [ -f "$state_file" ]; then
+                local state_project_id=$(basename "$state_file" .state)
+                local pid_file="$GITBOT_DIR/pids/${state_project_id}.pid"
+                
+                if [ -f "$pid_file" ]; then
+                    local old_pid=$(cat "$pid_file")
+                    if ! ps -p "$old_pid" > /dev/null 2>&1; then
+                        IFS='|' read -r repo_path interval repo_name enable_push < "$state_file"
+                        
+                        if [ -d "$repo_path" ]; then
+                            log "Detected dead process for $repo_name, restarting..."
+                            
+                            cd "$repo_path" || continue
+                            
+                            local monitor_script="$GITBOT_DIR/monitor_${state_project_id}.sh"
+                            create_monitor_script "$monitor_script"
+                            
+                            nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$GITBOT_DIR/logs/${state_project_id}.log" > /dev/null 2>&1 &
+                            
+                            local new_pid=$!
+                            echo "$new_pid" > "$pid_file"
+                            
+                            log "Restarted gitbot for $repo_name with PID $new_pid"
+                        fi
+                    fi
+                fi
+            fi
+        done
+    fi
+}
+
+setup_systemd_service() {
+    local service_dir="$HOME/.config/systemd/user"
+    local service_file="$service_dir/gitbot-restore.service"
+    local timer_file="$service_dir/gitbot-restore.timer"
+    
+    mkdir -p "$service_dir"
+    
+    cat > "$service_file" << EOF
+[Unit]
+Description=Gitbot Auto-Restore Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.gitbot/restore_all.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=default.target
+EOF
+
+    cat > "$timer_file" << EOF
+[Unit]
+Description=Gitbot Auto-Restore Timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$GITBOT_DIR/restore_all.sh" << 'EOF'
+#!/bin/bash
+GITBOT_DIR="$HOME/.gitbot"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$GITBOT_DIR/logs/restore.log"
+}
+
+log "Restore script started"
+
+for state_file in "$GITBOT_DIR/states"/*.state; do
+    if [ -f "$state_file" ]; then
+        state_project_id=$(basename "$state_file" .state)
+        pid_file="$GITBOT_DIR/pids/${state_project_id}.pid"
+        
+        if [ -f "$pid_file" ]; then
+            old_pid=$(cat "$pid_file")
+            if ps -p "$old_pid" > /dev/null 2>&1; then
+                log "Gitbot already running for project $state_project_id (PID: $old_pid)"
+                continue
+            fi
+        fi
+        
+        IFS='|' read -r repo_path interval repo_name enable_push < "$state_file"
+        
+        if [ -d "$repo_path" ]; then
+            log "Restoring gitbot for: $repo_name at $repo_path"
+            
+            cd "$repo_path" || continue
+            
+            monitor_script="$GITBOT_DIR/monitor_${state_project_id}.sh"
+            
+            if [ -f "$monitor_script" ]; then
+                nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$GITBOT_DIR/logs/${state_project_id}.log" > /dev/null 2>&1 &
+                
+                new_pid=$!
+                echo "$new_pid" > "$pid_file"
+                
+                log "Restored gitbot for $repo_name with PID $new_pid"
+            fi
+        fi
+    fi
+done
+
+log "Restore script completed"
+EOF
+
+    chmod +x "$GITBOT_DIR/restore_all.sh"
+    
+    if command -v systemctl &> /dev/null; then
+        systemctl --user daemon-reload 2>/dev/null
+        systemctl --user enable gitbot-restore.timer 2>/dev/null
+        systemctl --user start gitbot-restore.timer 2>/dev/null
+        
+        if systemctl --user is-active --quiet gitbot-restore.timer; then
+            print_msg "$GREEN" "Systemd auto-restore enabled"
+            log "Systemd service enabled"
+            return 0
+        fi
+    fi
+    
+    setup_cron_fallback
+}
+
+setup_cron_fallback() {
+    local cron_entry="@reboot $GITBOT_DIR/restore_all.sh"
+    
+    if crontab -l 2>/dev/null | grep -q "restore_all.sh"; then
+        log "Cron entry already exists"
+        return 0
+    fi
+    
+    (crontab -l 2>/dev/null; echo "$cron_entry") | crontab - 2>/dev/null
+    
+    if crontab -l 2>/dev/null | grep -q "restore_all.sh"; then
+        print_msg "$GREEN" "Cron auto-restore enabled"
+        log "Cron entry added for boot persistence"
+        return 0
+    else
+        print_msg  "Note: Could not enable auto-restore. Manually add to crontab: $cron_entry"
+        log "Warning: Could not enable auto-restore automatically"
+        return 1
     fi
 }
 
@@ -228,11 +422,9 @@ create_github_repo() {
     fi
 }
 
-# Setup GitHub remote
 setup_github_remote() {
     local repo_name="$1"
     
-    # Check if remote already exists
     if git remote get-url origin > /dev/null 2>&1; then
         print_msg "Remote 'origin' already exists:"
         git remote get-url origin
@@ -250,17 +442,14 @@ setup_github_remote() {
         exit 1
     fi
     
-    # Ask if user wants to create repo automatically
     print_msg "Create the repository on GitHub? (Y/n):"
     read -r auto_create
     auto_create=${auto_create:-y}
     
     if [[ "$auto_create" =~ ^[Yy] ]]; then
         if create_github_repo "$repo_name" "$github_user"; then
-            # Repository created successfully
             local remote_url="https://github.com/${github_user}/${repo_name}.git"
             
-            # Add remote if not already added by gh CLI
             if ! git remote get-url origin > /dev/null 2>&1; then
                 git remote add origin "$remote_url"
                 print_msg "$GREEN" "Added GitHub remote: $remote_url"
@@ -308,97 +497,9 @@ push_to_github() {
     fi
 }
 
-monitor_changes() {
-    local repo_path="$1"
-    local interval="$2"
-    local enable_push="$3"
+create_monitor_script() {
+    local monitor_script="$1"
     
-    log "Started monitoring $repo_path with interval ${interval}s (push: $enable_push)"
-    
-    while true; do
-        cd "$repo_path" || {
-            log "Error: Cannot access repository path $repo_path"
-            sleep "$interval"
-            continue
-        }
-        
-        git add -A 2>> "$LOG_FILE"
-        
-        if ! git diff --cached --quiet 2>> "$LOG_FILE"; then
-            local changed_files=$(git diff --cached --name-only | tr '\n' ', ' | sed 's/,$//')
-            
-            if [ -n "$changed_files" ]; then
-                local commit_msg="Edited: $changed_files"
-                
-                if git commit -m "$commit_msg" >> "$LOG_FILE" 2>&1; then
-                    log "Auto-committed changes: $changed_files"
-                    
-                    if [ "$enable_push" = "true" ]; then
-                        if git push origin main >> "$LOG_FILE" 2>&1; then
-                            log "Pushed changes to GitHub"
-                        else
-                            log "Error: Failed to push to GitHub"
-                        fi
-                    fi
-                else
-                    log "Error: Failed to commit changes"
-                fi
-            fi
-        fi
-        
-        sleep "$interval"
-    done
-}
-
-start_gitbot() {
-    local interval=""
-    local enable_push="false"
-    
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -h)
-                enable_push="true"
-                shift
-                ;;
-            *)
-                if [[ "$1" =~ ^[0-9]+$ ]]; then
-                    interval="$1"
-                fi
-                shift
-                ;;
-        esac
-    done
-    
-    local repo_path="$(pwd)"
-    
-    if [ -z "$interval" ] || ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
-        print_msg "$RED" "Invalid interval"
-        exit 1
-    fi
-    
-    if [ -f "$PID_FILE" ]; then
-        local old_pid=$(cat "$PID_FILE")
-        if ps -p "$old_pid" > /dev/null 2>&1; then
-            print_msg "$RED" "gitbot is already running. PID: $old_pid. Use 'gitbot end' to stop it first."
-            exit 1
-        else
-            print_msg  "Removing stale PID file..."
-            rm -f "$PID_FILE"
-        fi
-    fi
-    
-    local default_name=$(basename "$repo_path")
-    print_msg "Repository name [$default_name]: "
-    read -r repo_name
-    repo_name=${repo_name:-$default_name}
-    
-    print_msg  "Starting gitbot for '$repo_name'..."
-    
-    init_git_repo "$repo_path" "$repo_name" "$enable_push"
-    
-    echo "$repo_path|$interval|$repo_name|$enable_push" > "$STATE_FILE"
-    
-    local monitor_script="$GITBOT_DIR/monitor_${pid}.sh"
     cat > "$monitor_script" << 'MONITOR_EOF'
 #!/bin/bash
 REPO_PATH="$1"
@@ -412,7 +513,7 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
-log "Monitor started: PID $"
+log "Monitor started: PID $$"
 
 while true; do
     cd "$REPO_PATH" || {
@@ -450,6 +551,47 @@ done
 MONITOR_EOF
     
     chmod +x "$monitor_script"
+}
+
+start_gitbot() {
+    local interval=""
+    local enable_push="false"
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h)
+                enable_push="true"
+                shift
+                ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    interval="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    local repo_path="$(pwd)"
+    
+    if [ -z "$interval" ] || ! [[ "$interval" =~ ^[0-9]+$ ]] || [ "$interval" -lt 1 ]; then
+        print_msg "$RED" "Invalid interval"
+        exit 1
+    fi
+    
+    local default_name=$(basename "$repo_path")
+    print_msg "Repository name [$default_name]: "
+    read -r repo_name
+    repo_name=${repo_name:-$default_name}
+    
+    print_msg  "Starting gitbot for '$repo_name'..."
+    
+    init_git_repo "$repo_path" "$repo_name" "$enable_push"
+    
+    echo "$repo_path|$interval|$repo_name|$enable_push" > "$STATE_FILE"
+    
+    local monitor_script="$GITBOT_DIR/monitor_${PROJECT_ID}.sh"
+    create_monitor_script "$monitor_script"
     
     nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$LOG_FILE" > /dev/null 2>&1 &
     
@@ -462,6 +604,10 @@ MONITOR_EOF
         rm -f "$PID_FILE"
         rm -f "$monitor_script"
         exit 1
+    fi
+    
+    if [ ! -f "$GITBOT_DIR/restore_all.sh" ]; then
+        setup_systemd_service
     fi
     
     print_msg "$GREEN" "gitbot started"
@@ -477,39 +623,27 @@ MONITOR_EOF
     print_msg  "  PID: $pid"
     echo ""
     print_msg "gitbot is now monitoring changes in the background."
+    print_msg "Auto-restart on boot is enabled."
     print_msg "Use 'gitbot end' to halt"
     
     log "gitbot started: $repo_name at $repo_path, interval ${interval}s, push: $enable_push, PID $pid"
 }
 
-
 stop_gitbot() {
     if [ ! -f "$PID_FILE" ]; then
-        print_msg  "gitbot is not running"
+        echo "No gitbot running for this project"
         exit 0
     fi
-    
-    local pid=$(cat "$PID_FILE")
-    
-    if ps -p "$pid" > /dev/null 2>&1; then
-        kill "$pid" 2>> "$LOG_FILE"
-        sleep 1
-        
-        # Force kill if still running
-        if ps -p "$pid" > /dev/null 2>&1; then
-            kill -9 "$pid" 2>> "$LOG_FILE"
-        fi
-        
-        rm -f "$PID_FILE"
-        rm -f "$STATE_FILE"
-        rm -f "$GITBOT_DIR/monitor_${pid}.sh" 2>/dev/null
-        print_msg "$GREEN" "gitbot stopped"
-        log "gitbot stopped. PID: $pid"
+
+    PID=$(cat "$PID_FILE")
+
+    if kill "$PID" 2>/dev/null; then
+        rm -f "$PID_FILE" "$STATE_FILE"
+        echo "Stopped gitbot for project: $PWD"
+        log "Stopped gitbot manually"
     else
-        print_msg  "gitbot process not found"
+        echo "Process dead; cleaning stale PID"
         rm -f "$PID_FILE"
-        rm -f "$STATE_FILE"
-        rm -f "$GITBOT_DIR"/monitor_*.sh 2>/dev/null
     fi
 }
 
@@ -563,63 +697,12 @@ restart_gitbot() {
     
     cd "$repo_path" || exit 1
     
-    local pid=$
-    local monitor_script="$GITBOT_DIR/monitor_${pid}.sh"
-    cat > "$monitor_script" << 'MONITOR_EOF'
-#!/bin/bash
-REPO_PATH="$1"
-INTERVAL="$2"
-ENABLE_PUSH="$3"
-LOG_FILE="$4"
-
-cd "$REPO_PATH" || exit 1
-
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
-}
-
-log "Monitor restarted: PID $"
-
-while true; do
-    cd "$REPO_PATH" || {
-        log "Error: Cannot access repository path $REPO_PATH"
-        sleep "$INTERVAL"
-        continue
-    }
-    
-    git add -A 2>> "$LOG_FILE"
-    
-    if ! git diff --cached --quiet 2>> "$LOG_FILE"; then
-        changed_files=$(git diff --cached --name-only | tr '\n' ', ' | sed 's/,$//')
-        
-        if [ -n "$changed_files" ]; then
-            commit_msg="Edited: $changed_files"
-            
-            if git commit -m "$commit_msg" >> "$LOG_FILE" 2>&1; then
-                log "Auto-committed changes: $changed_files"
-                
-                if [ "$ENABLE_PUSH" = "true" ]; then
-                    if git push origin main >> "$LOG_FILE" 2>&1; then
-                        log "Pushed changes to GitHub"
-                    else
-                        log "Error: Failed to push to GitHub"
-                    fi
-                fi
-            else
-                log "Error: Failed to commit changes"
-            fi
-        fi
-    fi
-    
-    sleep "$INTERVAL"
-done
-MONITOR_EOF
-    
-    chmod +x "$monitor_script"
+    local monitor_script="$GITBOT_DIR/monitor_${PROJECT_ID}.sh"
+    create_monitor_script "$monitor_script"
     
     nohup bash "$monitor_script" "$repo_path" "$interval" "$enable_push" "$LOG_FILE" > /dev/null 2>&1 &
     
-    pid=$!
+    local pid=$!
     echo "$pid" > "$PID_FILE"
     
     log "gitbot restarted. PID $pid"
@@ -628,6 +711,8 @@ MONITOR_EOF
 main() {
     init_gitbot_dir
     check_git
+    
+    check_boot_and_restart
     
     case "${1:-}" in
         start)
@@ -649,10 +734,12 @@ main() {
             echo "Usage:"
             echo "  gitbot start <seconds> [-h]  Start monitoring and auto-committing"
             echo "                               -h: Enable push to GitHub"
-            echo "  gitbot end                   Stop monitoring"
+            echo "  gitbot end                   Stop monitoring this project"
             echo "  gitbot status                Show current status"
             echo ""
             echo "Example: gitbot start 600 -h   Monitor, commit and push current directory ./ to GitHub every 10 minutes"
+            echo ""
+            echo "Auto-restart on boot is enabled automatically."
             exit 1
             ;;
     esac
